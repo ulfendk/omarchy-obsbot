@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "ulfendk.obsbot",
+  "name": "OBSBOT Camera",
+  "version": "0.2.0",
+  "author": "Regin Ulf Nielsen",
+  "license": "MIT",
+  "description": "Control an OBSBOT Meet SE webcam from the Omarchy bar: zoom, pan/tilt, AI framing, HDR, focus, exposure, white balance, image tuning and presets.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "OBSBOT Camera",
+    "description": "Webcam controls for the OBSBOT Meet SE. Scroll on the icon to zoom, right-click to recenter.",
+    "category": "Utilities",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

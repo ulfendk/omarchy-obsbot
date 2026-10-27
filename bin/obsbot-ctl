@@ -1,0 +1,483 @@
+#!/usr/bin/env python3
+"""obsbot-ctl: control an OBSBOT Meet SE (or any UVC camera) through v4l2-ctl.
+
+Every command prints one JSON object on stdout so the Omarchy bar plugin can
+consume it directly.
+
+  obsbot-ctl present                      cheap hotplug check, never opens the device
+  obsbot-ctl state                        all controls + AI status
+  obsbot-ctl set NAME=VALUE [...]         clamp, snap to step, apply in dependency order
+  obsbot-ctl nudge NAME STEPS             relative change (e.g. zoom_absolute +1)
+  obsbot-ctl reset                        every control back to its default
+  obsbot-ctl restore                      re-apply the last applied values (after replug)
+  obsbot-ctl preset list|save|load|delete [NAME]
+  obsbot-ctl ai status                    AI framing + HDR (OBSBOT vendor protocol)
+  obsbot-ctl ai framing off|single|group
+  obsbot-ctl ai hdr on|off
+
+Environment:
+  OBSBOT_DEVICE=/dev/videoN   force a device instead of auto-detecting
+  OBSBOT_CTL_FAKE=FILE        demo mode: read controls from a saved `v4l2-ctl -L`
+                              dump, keep sets in $XDG_RUNTIME_DIR, never touch hardware
+"""
+
+import ctypes
+import fcntl
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "obsbot")
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "obsbot")
+PRESETS_FILE = os.path.join(CONFIG_DIR, "presets.json")
+LAST_FILE = os.path.join(STATE_DIR, "last.json")
+RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+FAKE_FILE = os.environ.get("OBSBOT_CTL_FAKE", "")
+FAKE_STATE = os.path.join(RUNTIME_DIR, "obsbot-ctl-fake.json")
+FAKE_XU = os.path.join(RUNTIME_DIR, "obsbot-ctl-fake-xu.bin")
+if FAKE_FILE:
+    # Demo mode keeps its presets and last values away from the real ones.
+    PRESETS_FILE = os.path.join(RUNTIME_DIR, "obsbot-ctl-fake-presets.json")
+    LAST_FILE = os.path.join(RUNTIME_DIR, "obsbot-ctl-fake-last.json")
+
+# Motion controls: writing them starts/stops movement rather than storing a
+# setting, so they never go into presets, resets or restores.
+MOTION = {"zoom_continuous", "pan_speed", "tilt_speed", "pan_relative", "tilt_relative", "zoom_relative"}
+
+# Mode switches go first so the values they unlock are writable afterwards.
+# Each dependent control is only writable when its mode allows manual values.
+MODES = ["auto_exposure", "focus_automatic_continuous", "white_balance_automatic"]
+DEPENDS = {
+    "exposure_time_absolute": ("auto_exposure", lambda v: v == 1),
+    "focus_absolute": ("focus_automatic_continuous", lambda v: v == 0),
+    "white_balance_temperature": ("white_balance_automatic", lambda v: v == 0),
+    "red_balance": ("white_balance_automatic", lambda v: v == 0),
+    "blue_balance": ("white_balance_automatic", lambda v: v == 0),
+}
+
+# OBSBOT vendor extension unit. Everything goes through unit 2, selector 6 as
+# 60-byte blocks: SET_CUR sends a short command padded with zeros, GET_CUR
+# returns a status block. Layout mapped on a Meet SE (fw 0x0510); it matches
+# what the Tiny 2 community projects (tiny2, Tiny4Linux, meet4k) found:
+#   status[0x06]  HDR on/off           command 01 01 <0|1>
+#   status[0x18]  AI framing mode      command 16 02 <mode> <style>
+#   status[0x1c]  AI framing style
+XU_UNIT, XU_SELECTOR, XU_SIZE = 2, 6, 60
+UVC_SET_CUR, UVC_GET_CUR = 0x01, 0x81
+HDR_BYTE, MODE_BYTE, STYLE_BYTE = 0x06, 0x18, 0x1c
+FRAMING = {"off": 0, "group": 1, "single": 2}
+FRAMING_NAMES = {v: k for k, v in FRAMING.items()}
+# Status block captured from a Meet SE, used as the demo-mode starting point.
+FAKE_XU_INITIAL = bytes.fromhex(
+    "270000010000000101037800000101020000000001000400010103000100001e1103100000008d0c"
+).ljust(XU_SIZE, b"\0")
+
+
+class XuQuery(ctypes.Structure):
+    # struct uvc_xu_control_query from <linux/uvcvideo.h>
+    _fields_ = [("unit", ctypes.c_uint8), ("selector", ctypes.c_uint8), ("query", ctypes.c_uint8),
+                ("size", ctypes.c_uint16), ("data", ctypes.POINTER(ctypes.c_uint8))]
+
+
+UVCIOC_CTRL_QUERY = (3 << 30) | (ctypes.sizeof(XuQuery) << 16) | (ord("u") << 8) | 0x21
+
+CTRL_RE = re.compile(r"^\s*(\w+)\s+0x[0-9a-f]+\s+\((\w+)\)\s*:\s*(.*)$")
+MENU_RE = re.compile(r"^\s+(\d+):\s+(.*)$")
+
+
+def out(obj, code=0):
+    print(json.dumps(obj))
+    sys.exit(code)
+
+
+def fail(msg, **extra):
+    out(dict({"ok": False, "error": msg}, **extra), 1)
+
+
+def parse_controls(text):
+    """Parse `v4l2-ctl -L` output into {name: {...}} preserving order."""
+    controls = {}
+    current = None
+    for line in text.splitlines():
+        m = CTRL_RE.match(line)
+        if m:
+            name, ctype, rest = m.groups()
+            fields = dict(re.findall(r"(\w+)=(-?\d+)", rest))
+            flags = re.search(r"flags=(.*)$", rest)
+            flags = [f.strip() for f in flags.group(1).split(",")] if flags else []
+            ctrl = {"type": ctype}
+            for key in ("min", "max", "step", "default", "value"):
+                if key in fields:
+                    ctrl[key] = int(fields[key])
+            if ctype == "bool":
+                ctrl.setdefault("min", 0)
+                ctrl.setdefault("max", 1)
+                ctrl.setdefault("step", 1)
+            ctrl["inactive"] = "inactive" in flags
+            ctrl["readonly"] = "read-only" in flags
+            if ctype == "menu":
+                ctrl["menu"] = {}
+            controls[name] = ctrl
+            current = ctrl
+            continue
+        m = MENU_RE.match(line)
+        if m and current is not None and current.get("type") == "menu":
+            current["menu"][m.group(1)] = m.group(2).strip()
+            continue
+        if not line.strip() or line.strip().endswith("Controls"):
+            current = None
+    return controls
+
+
+def find_device():
+    forced = os.environ.get("OBSBOT_DEVICE")
+    if forced:
+        return forced if os.path.exists(forced) else None
+    if FAKE_FILE:
+        return "fake"
+    # by-id links exist only while the camera is plugged in; globbing them
+    # never opens the device, so this is safe while a call is using it.
+    for path in sorted(glob.glob("/dev/v4l/by-id/*OBSBOT*-video-index0")):
+        return os.path.realpath(path)
+    return None
+
+
+def load_json(path, fallback):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return fallback
+
+
+def save_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+def recompute_inactive(controls):
+    for name, (mode, writable) in DEPENDS.items():
+        if name in controls and mode in controls:
+            controls[name]["inactive"] = not writable(controls[mode]["value"])
+
+
+def read_controls(dev):
+    if dev == "fake":
+        with open(FAKE_FILE) as f:
+            controls = parse_controls(f.read())
+        for name, value in load_json(FAKE_STATE, {}).items():
+            if name in controls:
+                controls[name]["value"] = value
+        recompute_inactive(controls)
+        return controls
+    proc = subprocess.run(["v4l2-ctl", "-d", dev, "-L"], capture_output=True, text=True, timeout=5)
+    if proc.returncode != 0:
+        fail("v4l2-ctl failed: " + proc.stderr.strip(), present=True)
+    return parse_controls(proc.stdout)
+
+
+def write_control(dev, name, value):
+    if dev == "fake":
+        fake = load_json(FAKE_STATE, {})
+        fake[name] = value
+        save_json(FAKE_STATE, fake)
+        return None
+    proc = subprocess.run(["v4l2-ctl", "-d", dev, "--set-ctrl=%s=%d" % (name, value)],
+                          capture_output=True, text=True, timeout=5)
+    if proc.returncode != 0:
+        return proc.stderr.strip() or "v4l2-ctl exited %d" % proc.returncode
+    return None
+
+
+def coerce(ctrl, value):
+    value = int(round(float(value)))
+    if ctrl["type"] == "menu":
+        if str(value) not in ctrl.get("menu", {}):
+            raise ValueError("not a menu entry")
+        return value
+    lo, hi, step = ctrl.get("min", value), ctrl.get("max", value), ctrl.get("step", 1) or 1
+    value = max(lo, min(hi, value))
+    return lo + round((value - lo) / step) * step
+
+
+def apply_values(dev, controls, values):
+    """Write values in dependency order, skipping ones their mode locks out.
+
+    Returns (applied, errors). `controls` is updated in place so the caller
+    can report fresh state without a second device read.
+    """
+    order = [n for n in MODES if n in values] + [n for n in values if n not in MODES]
+    applied, errors = {}, {}
+    for name in order:
+        ctrl = controls.get(name)
+        if ctrl is None:
+            errors[name] = "unknown control"
+            continue
+        if ctrl.get("readonly"):
+            errors[name] = "read-only"
+            continue
+        try:
+            value = coerce(ctrl, values[name])
+        except (TypeError, ValueError) as e:
+            errors[name] = "bad value: %s" % e
+            continue
+        dep = DEPENDS.get(name)
+        if dep and dep[0] in controls and not dep[1](controls[dep[0]]["value"]):
+            # Locked by its auto mode; keep the value for when it unlocks.
+            continue
+        err = write_control(dev, name, value)
+        if err:
+            errors[name] = err
+            continue
+        ctrl["value"] = value
+        applied[name] = value
+        if name in MODES:
+            recompute_inactive(controls)
+    return applied, errors
+
+
+def settings_of(controls):
+    return {n: c["value"] for n, c in controls.items()
+            if n not in MOTION and not c.get("readonly") and "value" in c}
+
+
+def remember(controls):
+    save_json(LAST_FILE, settings_of(controls))
+
+
+def xu_query(dev, query, payload=b""):
+    if dev == "fake":
+        block = bytearray(load_bytes(FAKE_XU, FAKE_XU_INITIAL))
+        if query == UVC_SET_CUR:
+            fake_xu_apply(block, payload)
+            with open(FAKE_XU, "wb") as f:
+                f.write(block)
+        return bytes(block)
+    buf = (ctypes.c_uint8 * XU_SIZE)(*payload.ljust(XU_SIZE, b"\0"))
+    q = XuQuery(XU_UNIT, XU_SELECTOR, query, XU_SIZE, ctypes.cast(buf, ctypes.POINTER(ctypes.c_uint8)))
+    fd = os.open(dev, os.O_RDWR)
+    try:
+        fcntl.ioctl(fd, UVCIOC_CTRL_QUERY, q)
+    finally:
+        os.close(fd)
+    return bytes(buf)
+
+
+def load_bytes(path, fallback):
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError:
+        return fallback
+
+
+def fake_xu_apply(block, payload):
+    """What the camera does with the commands we send, for demo mode."""
+    if payload[:2] == b"\x01\x01":
+        block[HDR_BYTE] = payload[2]
+    elif payload[:2] == b"\x16\x02":
+        block[MODE_BYTE], block[STYLE_BYTE] = payload[2], payload[3]
+
+
+def decode_ai(block):
+    mode = block[MODE_BYTE]
+    return {"available": True,
+            "framing": FRAMING_NAMES.get(mode, "mode-%d" % mode),
+            "framingStyle": block[STYLE_BYTE],
+            "hdr": block[HDR_BYTE] != 0}
+
+
+def ai_status(dev):
+    try:
+        return decode_ai(xu_query(dev, UVC_GET_CUR))
+    except OSError as e:
+        return {"available": False, "error": "vendor unit: %s" % e.strerror}
+
+
+def ai_send(dev, payload):
+    xu_query(dev, UVC_SET_CUR, payload)
+    # The firmware applies mode changes asynchronously; read back once it has.
+    for _ in range(10):
+        time.sleep(0.1)
+        status = ai_status(dev)
+        if dev == "fake" or ai_matches(status, payload):
+            return status
+    return status
+
+
+def ai_matches(status, payload):
+    if payload[:2] == b"\x01\x01":
+        return status.get("hdr") == bool(payload[2])
+    if payload[:2] == b"\x16\x02":
+        return FRAMING.get(status.get("framing")) == payload[2]
+    return True
+
+
+def state_obj(dev, controls, **extra):
+    obj = {"ok": True, "present": True, "fake": dev == "fake", "device": dev,
+           "controls": controls, "ai": ai_status(dev)}
+    obj.update(extra)
+    return obj
+
+
+def require_device():
+    dev = find_device()
+    if not dev:
+        out({"ok": False, "present": False})
+    return dev
+
+
+def parse_assignments(args):
+    values = {}
+    for arg in args:
+        if "=" not in arg:
+            fail("expected NAME=VALUE, got %r" % arg)
+        name, value = arg.split("=", 1)
+        values[name] = value
+    return values
+
+
+def cmd_present(args):
+    dev = find_device()
+    out({"ok": True, "present": bool(dev), "fake": dev == "fake", "device": dev})
+
+
+def cmd_state(args):
+    dev = require_device()
+    out(state_obj(dev, read_controls(dev)))
+
+
+def cmd_set(args):
+    if not args:
+        fail("usage: obsbot-ctl set NAME=VALUE [...]")
+    values = parse_assignments(args)
+    dev = require_device()
+    controls = read_controls(dev)
+    applied, errors = apply_values(dev, controls, values)
+    remember(controls)
+    out(state_obj(dev, controls, applied=applied, errors=errors), 1 if errors else 0)
+
+
+def cmd_nudge(args):
+    if len(args) != 2:
+        fail("usage: obsbot-ctl nudge NAME STEPS")
+    name, steps = args[0], int(args[1])
+    dev = require_device()
+    controls = read_controls(dev)
+    ctrl = controls.get(name)
+    if ctrl is None:
+        fail("unknown control " + name)
+    target = ctrl["value"] + steps * (ctrl.get("step") or 1)
+    applied, errors = apply_values(dev, controls, {name: target})
+    remember(controls)
+    out(state_obj(dev, controls, applied=applied, errors=errors), 1 if errors else 0)
+
+
+def cmd_reset(args):
+    dev = require_device()
+    controls = read_controls(dev)
+    defaults = {}
+    for name, ctrl in controls.items():
+        if name in MOTION or ctrl.get("readonly") or "default" not in ctrl:
+            continue
+        # Some firmware reports defaults outside the menu (power_line_frequency
+        # default=3 with entries 0-2); leave those controls as they are.
+        if ctrl["type"] == "menu" and str(ctrl["default"]) not in ctrl.get("menu", {}):
+            continue
+        defaults[name] = ctrl["default"]
+    applied, errors = apply_values(dev, controls, defaults)
+    remember(controls)
+    out(state_obj(dev, controls, applied=applied, errors=errors), 1 if errors else 0)
+
+
+def cmd_restore(args):
+    dev = require_device()
+    last = load_json(LAST_FILE, None)
+    if not last:
+        out({"ok": True, "present": True, "restored": False})
+    controls = read_controls(dev)
+    applied, errors = apply_values(dev, controls, last)
+    out(state_obj(dev, controls, restored=True, applied=applied, errors=errors), 1 if errors else 0)
+
+
+def cmd_preset(args):
+    if not args:
+        fail("usage: obsbot-ctl preset list|save|load|delete [NAME]")
+    action, name = args[0], " ".join(args[1:]).strip()
+    data = load_json(PRESETS_FILE, {"presets": {}})
+    presets = data.setdefault("presets", {})
+    if action == "list":
+        out({"ok": True, "presets": sorted(presets.keys(), key=str.lower)})
+    if not name:
+        fail("preset %s needs a NAME" % action)
+    if action == "delete":
+        presets.pop(name, None)
+        save_json(PRESETS_FILE, data)
+        out({"ok": True, "presets": sorted(presets.keys(), key=str.lower)})
+    dev = require_device()
+    controls = read_controls(dev)
+    if action == "save":
+        presets[name] = settings_of(controls)
+        save_json(PRESETS_FILE, data)
+        out({"ok": True, "saved": name, "presets": sorted(presets.keys(), key=str.lower)})
+    if action == "load":
+        if name not in presets:
+            fail("no preset named " + name)
+        applied, errors = apply_values(dev, controls, presets[name])
+        remember(controls)
+        out(state_obj(dev, controls, applied=applied, errors=errors, preset=name), 1 if errors else 0)
+    fail("unknown preset action " + action)
+
+
+def cmd_ai(args):
+    usage = "usage: obsbot-ctl ai status | framing off|single|group | hdr on|off"
+    dev = require_device()
+    if not args or args[0] == "status":
+        out(dict(ai_status(dev), ok=True, present=True))
+    if len(args) != 2:
+        fail(usage)
+    what, value = args
+    try:
+        if what == "hdr" and value in ("on", "off"):
+            status = ai_send(dev, bytes([0x01, 0x01, int(value == "on")]))
+        elif what == "framing" and value in FRAMING:
+            # Keep the current framing style when switching between single and
+            # group; it means nothing once framing is off.
+            current = xu_query(dev, UVC_GET_CUR)
+            style = current[STYLE_BYTE] if FRAMING[value] and current[MODE_BYTE] else 0
+            status = ai_send(dev, bytes([0x16, 0x02, FRAMING[value], style]))
+        else:
+            fail(usage)
+    except OSError as e:
+        fail("vendor unit: %s" % e.strerror, present=True)
+    out(dict(status, ok=True, present=True))
+
+
+COMMANDS = {
+    "present": cmd_present,
+    "state": cmd_state,
+    "set": cmd_set,
+    "nudge": cmd_nudge,
+    "reset": cmd_reset,
+    "restore": cmd_restore,
+    "preset": cmd_preset,
+    "ai": cmd_ai,
+}
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        sys.stderr.write(__doc__)
+        sys.exit(2)
+    COMMANDS[sys.argv[1]](sys.argv[2:])
+
+
+if __name__ == "__main__":
+    main()
